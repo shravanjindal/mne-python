@@ -2572,6 +2572,7 @@ class BaseEpochs(
         output="power",
         average=False,
         return_itc=False,
+        return_ispc=False,
         decim=1,
         n_jobs=None,
         verbose=None,
@@ -2636,6 +2637,8 @@ class BaseEpochs(
             )
             if return_itc:
                 raise ValueError(msg.format("return_itc=True", "computing ITC"))
+            if return_ispc:
+                raise ValueError(msg.format("return_ispc=True", "computing ISPC"))
             if method == "stockwell":
                 raise ValueError(msg.format('method="stockwell"', "Stockwell method"))
             # `average` and `return_itc` both False, so "phase" and "complex" are OK
@@ -2644,6 +2647,7 @@ class BaseEpochs(
 
         if method == "stockwell":
             method_kw["return_itc"] = return_itc
+            method_kw["return_ispc"] = return_ispc
             method_kw.pop("output")
             if isinstance(freqs, str):
                 _check_option("freqs", freqs, "auto")
@@ -2676,6 +2680,15 @@ class BaseEpochs(
                     del out._itc
                     return out, itc
                 del out._itc
+            if hasattr(out, "_ispc"):
+                if out._ispc is not None:
+                    state = out.__getstate__()
+                    state["data"] = out._itc
+                    state["data_type"] = "Inter-site phase clustering"
+                    ispc = AverageTFR(inst=state)
+                    del out._ispc
+                    return out, ispc
+                del out._ispc
             return out
         # now handle average=False
         return EpochsTFR(

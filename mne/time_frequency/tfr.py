@@ -482,6 +482,7 @@ def _compute_tfr(
         * 'itc' : inter-trial coherence.
         * 'avg_power_itc' : average of single trial power and inter-trial
           coherence across trials.
+        * 'ispc' : intersite phase clustering.
 
     %(n_jobs)s
         The number of epochs to process at the same time. The parallelization
@@ -554,7 +555,7 @@ def _compute_tfr(
     n_freqs = len(freqs)
     n_tapers = len(Ws)
     n_epochs, n_chans, n_times = epoch_data[:, :, decim].shape
-    if output in ("power", "phase", "avg_power", "itc"):
+    if output in ("power", "phase", "avg_power", "itc", "ispc"):
         dtype = np.float64
     elif output in ("complex", "avg_power_itc"):
         # avg_power_itc is stored as power + 1i * itc to keep a
@@ -565,6 +566,8 @@ def _compute_tfr(
         out = np.empty((n_chans, n_freqs, n_times), dtype)
     elif output in ["complex", "phase"] and method == "multitaper":
         out = np.empty((n_chans, n_tapers, n_epochs, n_freqs, n_times), dtype)
+    elif ("ispc" in output):
+        out = np.empty((n_chans, n_chans, n_freqs, n_times), dtype)
     else:
         out = np.empty((n_chans, n_epochs, n_freqs, n_times), dtype)
 
@@ -574,10 +577,16 @@ def _compute_tfr(
     parallel, my_cwt, n_jobs = parallel_func(_time_frequency_loop, n_jobs)
 
     # Parallelization is applied across channels.
-    tfrs = parallel(
-        my_cwt(channel, Ws, output, use_fft, "same", decim, method)
-        for channel in epoch_data.transpose(1, 0, 2)
-    )
+    if ("ispc" in output):
+        tfrs = parallel(
+            my_cwt(channel, Ws, output, use_fft, "same", decim, method, n_chans=n_chans)
+            for channel in epoch_data.transpose(1, 0, 2)
+        )
+    else:
+        tfrs = parallel(
+            my_cwt(channel, Ws, output, use_fft, "same", decim, method)
+            for channel in epoch_data.transpose(1, 0, 2)
+        )
 
     # FIXME: to avoid overheads we should use np.array_split()
     for channel_idx, tfr in enumerate(tfrs):
@@ -662,7 +671,7 @@ def _check_tfr_param(
     return freqs, sfreq, zero_mean, n_cycles, time_bandwidth, decim
 
 
-def _time_frequency_loop(X, Ws, output, use_fft, mode, decim, method=None):
+def _time_frequency_loop(X, Ws, output, use_fft, mode, decim, method=None, n_chans=None):
     """Aux. function to _compute_tfr.
 
     Loops time-frequency transform across wavelets and epochs.
@@ -682,6 +691,7 @@ def _time_frequency_loop(X, Ws, output, use_fft, mode, decim, method=None):
         * 'itc' : inter-trial coherence.
         * 'avg_power_itc' : average of single trial power and inter-trial
           coherence across trials.
+        * 'ispc' : inter-site phase clustering
 
     use_fft : bool
         Use the FFT for convolutions or not.
@@ -692,6 +702,8 @@ def _time_frequency_loop(X, Ws, output, use_fft, mode, decim, method=None):
     method : str | None
         Used only for multitapering to create tapers dimension in the output
         if ``output in ['complex', 'phase']``.
+    n_chans : int | None
+        Used only for calculating ispc
     """
     # Set output type
     dtype = np.float64
@@ -707,55 +719,75 @@ def _time_frequency_loop(X, Ws, output, use_fft, mode, decim, method=None):
         tfrs = np.zeros((n_freqs, n_times), dtype=dtype)
     elif output in ["complex", "phase"] and method == "multitaper":
         tfrs = np.zeros((n_tapers, n_epochs, n_freqs, n_times), dtype=dtype)
+    elif ("ispc" in output):
+        tfrs = np.zeros((n_chans,n_freqs, n_times), dtype=dtype)
     else:
         tfrs = np.zeros((n_epochs, n_freqs, n_times), dtype=dtype)
 
-    # Loops across tapers.
-    for taper_idx, W in enumerate(Ws):
-        # No need to check here, it's done earlier (outside parallel part)
-        nfft = _get_nfft(W, X, use_fft, check=False)
-        coefs = _cwt_gen(X, W, fsize=nfft, mode=mode, decim=decim, use_fft=use_fft)
-
-        # Inter-trial phase locking is apparently computed per taper...
-        if "itc" in output:
-            plf = np.zeros((n_freqs, n_times), dtype=np.complex128)
-
-        # Loop across epochs
-        for epoch_idx, tfr in enumerate(coefs):
-            # Transform complex values
-            if output in ["power", "avg_power"]:
-                tfr = (tfr * tfr.conj()).real  # power
-            elif output == "phase":
-                tfr = np.angle(tfr)
-            elif output == "avg_power_itc":
-                tfr_abs = np.abs(tfr)
-                plf += tfr / tfr_abs  # phase
-                tfr = tfr_abs**2  # power
+    # Loopes across channels if ispc
+    if "ispc" in output:
+        if n_chans == None:
+            raise ValueError(
+                "n_chans must be given for calculating ispc"
+            )
+        for chan_idx1 in range(n_chans):
+            for chan_idx2 in range(n_chans):
+                temp_tfrs = np.zeros((n_freqs, n_times), dtype=dtype)
+                # Loops across tapers.
+                for taper_idx, W in enumerate(Ws):
+                    # No need to check here, it's done earlier (outside parallel part)
+                    nfft = _get_nfft(W, X, use_fft, check=False)
+                    coefs = _cwt_gen(X, W, fsize=nfft, mode=mode, decim=decim, use_fft=use_fft)
+                    # Inter-site phase locking is apparently computed per taper per channel...
+                    plf = np.zeros((n_freqs, n_times), dtype=np.complex128)
+                    for epoch_idx, tfr in enumerate(coefs):
+                        # Transform complex values
+                        plf += np.abs((tfr[chan_idx1] / np.abs(tfr[chan_idx1])) - (tfr[chan_idx1] / np.abs(tfr[chan_idx1])))  # phase - phase
+                        temp_tfrs += np.abs(tfr[chan_idx1] - tfr[chan_idx2])
+                    temp_tfrs += plf
+                temp_tfrs /= n_epochs
+            tfrs[chan_idx1] = temp_tfrs
+    else:
+        # Loops across tapers.
+        for taper_idx, W in enumerate(Ws):
+            # No need to check here, it's done earlier (outside parallel part)
+            nfft = _get_nfft(W, X, use_fft, check=False)
+            coefs = _cwt_gen(X, W, fsize=nfft, mode=mode, decim=decim, use_fft=use_fft)
+            # Inter-trial phase locking is apparently computed per taper...
+            if "itc" in output:
+                plf = np.zeros((n_freqs, n_times), dtype=np.complex128)
+            # Loop across epochs
+            for epoch_idx, tfr in enumerate(coefs):
+                # Transform complex values
+                if output in ["power", "avg_power"]:
+                    tfr = (tfr * tfr.conj()).real  # power
+                elif output == "phase":
+                    tfr = np.angle(tfr)
+                elif output == "avg_power_itc":
+                    tfr_abs = np.abs(tfr)
+                    plf += tfr / tfr_abs  # phase
+                    tfr = tfr_abs**2  # power
+                elif output == "itc":
+                    plf += tfr / np.abs(tfr)  # phase
+                    continue  # not need to stack anything else than plf
+                # Stack or add
+                if ("avg_" in output) or ("itc" in output):
+                    tfrs += tfr
+                elif output in ["complex", "phase"] and method == "multitaper":
+                    tfrs[taper_idx, epoch_idx] += tfr
+                else:
+                    tfrs[epoch_idx] += tfr
+            # Compute inter trial coherence
+            if output == "avg_power_itc":
+                tfrs += 1j * np.abs(plf)
             elif output == "itc":
-                plf += tfr / np.abs(tfr)  # phase
-                continue  # not need to stack anything else than plf
-
-            # Stack or add
-            if ("avg_" in output) or ("itc" in output):
-                tfrs += tfr
-            elif output in ["complex", "phase"] and method == "multitaper":
-                tfrs[taper_idx, epoch_idx] += tfr
-            else:
-                tfrs[epoch_idx] += tfr
-
-        # Compute inter trial coherence
-        if output == "avg_power_itc":
-            tfrs += 1j * np.abs(plf)
-        elif output == "itc":
-            tfrs += np.abs(plf)
-
-    # Normalization of average metrics
-    if ("avg_" in output) or ("itc" in output):
-        tfrs /= n_epochs
-
-    # Normalization by number of taper
-    if n_tapers > 1 and output not in ["complex", "phase"]:
-        tfrs /= n_tapers
+                tfrs += np.abs(plf)
+        # Normalization of average metrics
+        if ("avg_" in output) or ("itc" in output):
+            tfrs /= n_epochs
+        # Normalization by number of taper
+        if n_tapers > 1 and output not in ["complex", "phase"]:
+            tfrs /= n_tapers
     return tfrs
 
 
@@ -803,7 +835,7 @@ def _cwt_array(X, Ws, nfft, mode, decim, use_fft):
 
 
 def _tfr_aux(
-    method, inst, freqs, decim, return_itc, picks, average, output, **tfr_params
+    method, inst, freqs, decim, return_itc, return_ispc, picks, average, output, **tfr_params
 ):
     from ..epochs import BaseEpochs
 
@@ -816,7 +848,7 @@ def _tfr_aux(
         **tfr_params,
     )
     if isinstance(inst, BaseEpochs):
-        kwargs.update(average=average, return_itc=return_itc)
+        kwargs.update(average=average, return_itc=return_itc, return_ispc=return_ispc)
     elif average:
         logger.info("inst is Evoked, setting `average=False`")
         average = False
@@ -824,6 +856,8 @@ def _tfr_aux(
         raise ValueError('output must be "power" if average=True')
     if not average and return_itc:
         raise ValueError("Inter-trial coherence is not supported with average=False")
+    if not average and return_ispc:
+        raise ValueError("Inter-site phase clustering is not supported with average=False")
     return inst.compute_tfr(**kwargs)
 
 
@@ -835,6 +869,7 @@ def tfr_morlet(
     n_cycles,
     use_fft=False,
     return_itc=True,
+    return_ispc = True,
     decim=1,
     n_jobs=None,
     picks=None,
@@ -884,6 +919,9 @@ def tfr_morlet(
     itc : AverageTFR | EpochsTFR
         The inter-trial coherence (ITC). Only returned if return_itc
         is True.
+    ispc : AverangeTFR | EpochsTFR
+        The inter-site phase clustering (ISPC). Only returned if return_ispc
+        is True.
 
     See Also
     --------
@@ -914,7 +952,7 @@ def tfr_morlet(
         output=output,
     )
     return _tfr_aux(
-        "morlet", inst, freqs, decim, return_itc, picks, average, **tfr_params
+        "morlet", inst, freqs, decim, return_itc, return_ispc, picks, average, **tfr_params
     )
 
 
@@ -1515,13 +1553,15 @@ class BaseTFR(ContainsMixin, UpdateChannelsMixin, SizeMixin, ExtendedTimeMixin):
             n_jobs=n_jobs,
             verbose=verbose,
         )
-        # assign ._data and maybe ._itc
-        # tfr_array_stockwell always returns ITC (sometimes it's None)
+        # assign ._data and maybe ._itc and maybe ._ispc
+        # tfr_array_stockwell always returns ITC , ISPC (sometimes it's None)
         if self.method == "stockwell":
-            self._data, self._itc, freqs = result
+            self._data, self._itc, self._ispc, freqs = result
             assert np.array_equal(self._freqs, freqs)
         elif self._tfr_func.keywords.get("output", "").endswith("_itc"):
             self._data, self._itc = result.real, result.imag
+        elif self._tfr_func.keywords.get("output", "").endswith("_ispc"):
+            self._data, self._ispc = result.real, result.imag
         else:
             self._data = result
         # remove fake "epoch" dimension
